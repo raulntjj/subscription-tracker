@@ -1,0 +1,167 @@
+services:
+  # Backend - Laravel com FrankenPHP
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: ops/development/Dockerfile
+    container_name: subs-tracker-backend
+    restart: unless-stopped
+    working_dir: /var/www/html
+    env_file: .env
+    volumes:
+      - ../../backend:/var/www/html
+      - ../../backend/ops/development/php/php.ini:/usr/local/etc/php/conf.d/custom.ini
+    ports:
+      - "8001:8000"
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-sessions:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # Frontend - Next.js
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: ops/development/Dockerfile
+    container_name: subs-tracker-frontend
+    restart: unless-stopped
+    working_dir: /app
+    env_file: .env
+    volumes:
+      - ../../frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - backend
+
+  # MySQL 8.0
+  mysql:
+    image: mysql:8.0
+    container_name: subs-tracker-mysql
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../../backend/ops/development/mysql/my.cnf:/etc/mysql/conf.d/custom.cnf
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: --default-authentication-plugin=mysql_native_password
+
+  # Redis Cache
+  redis-cache:
+    image: redis:7-alpine
+    container_name: subs-tracker-redis-cache
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-cache-data:/data
+      - ../../backend/ops/development/redis/cache.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server /usr/local/etc/redis/redis.conf
+
+  # Redis Sessions
+  redis-sessions:
+    image: redis:7-alpine
+    container_name: subs-tracker-redis-sessions
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis-sessions-data:/data
+      - ../../backend/ops/development/redis/sessions.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server /usr/local/etc/redis/redis.conf
+    
+  # RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: subs-tracker-rabbitmq
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - subs-tracker-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Redis Commander (debug)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: subs-tracker-redis-commander
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8081:8081"
+    networks:
+      - subs-tracker-network
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      redis-sessions:
+        condition: service_healthy
+
+networks:
+  subs-tracker-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local
+  redis-cache-data:
+    driver: local
+  redis-sessions-data:
+    driver: local
+  rabbitmq-data:
+    driver: local
