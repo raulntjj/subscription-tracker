@@ -1,0 +1,229 @@
+name: Ops Validation
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'ops/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'ops/**'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-security:
+    name: "Security Validation"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for sensitive files
+        run: |
+          echo "Checking for sensitive files..."
+          
+          SENSITIVE_PATTERNS=(
+            "*.env"
+            "*.key"
+            "*.pem"
+            "*.p12"
+            "*.pfx"
+            "*secret*"
+            "*password*"
+          )
+          
+          found_sensitive=0
+          
+          for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+            files=$(find ops/ -type f -iname "$pattern" 2>/dev/null || true)
+            if [ ! -z "$files" ]; then
+              echo "Error: Found sensitive files matching pattern: $pattern"
+              echo "$files"
+              found_sensitive=1
+            fi
+          done
+          
+          if [ $found_sensitive -eq 1 ]; then
+            echo ""
+            echo "Sensitive files detected in ops/ directory"
+            echo "These files must be added to .gitignore"
+            exit 1
+          fi
+          
+          echo "No sensitive files found"
+
+      - name: Validate .gitignore coverage
+        run: |
+          echo "Validating .gitignore coverage..."
+          
+          if [ ! -f "ops/.gitignore" ]; then
+            echo "Warning: ops/.gitignore not found"
+            echo "Consider adding one to protect sensitive files"
+          else
+            essential_patterns=("*.env" ".env" "*.key" "*.pem")
+            missing_patterns=()
+            
+            for pattern in "${essential_patterns[@]}"; do
+              if ! grep -q "$pattern" ops/.gitignore; then
+                missing_patterns+=("$pattern")
+              fi
+            done
+            
+            if [ ${#missing_patterns[@]} -gt 0 ]; then
+              echo "Warning: Missing patterns in ops/.gitignore:"
+              printf '%s\n' "${missing_patterns[@]}"
+            fi
+          fi
+
+      - name: Scan for hardcoded secrets
+        run: |
+          echo "Scanning for hardcoded secrets..."
+          
+          SECRET_PATTERNS=(
+            "password\s*=\s*['\"][^'\"]{8,}"
+            "secret\s*=\s*['\"][^'\"]{8,}"
+            "api[_-]?key\s*[=:]\s*['\"][^'\"]{8,}"
+            "token\s*[=:]\s*['\"][^'\"]{20,}"
+          )
+          
+          found_secrets=0
+          
+          for pattern in "${SECRET_PATTERNS[@]}"; do
+            matches=$(grep -rniE "$pattern" ops/ --include="*.yml" --include="*.yaml" 2>/dev/null || true)
+            if [ ! -z "$matches" ]; then
+              echo "Warning: Possible hardcoded secret detected"
+              echo "$matches"
+              found_secrets=1
+            fi
+          done
+          
+          if [ $found_secrets -eq 1 ]; then
+            echo ""
+            echo "Potential hardcoded secrets detected"
+            exit 1
+          fi
+
+  validate-docker:
+    name: "Docker Validation"
+    runs-on: ubuntu-latest
+    needs: validate-security
+
+    strategy:
+      matrix:
+        environment: [development, production]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check compose file existence
+        id: check_compose
+        run: |
+          if [ -f "ops/${{ matrix.environment }}/docker-compose.yml" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Found docker-compose.yml for ${{ matrix.environment }}"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "No docker-compose.yml found for ${{ matrix.environment }}"
+          fi
+
+      - name: Validate compose syntax
+        if: steps.check_compose.outputs.exists == 'true'
+        run: |
+          echo "Validating syntax..."
+          cd ops/${{ matrix.environment }}
+          
+          # Create temporary .env if it doesn't exist (for validation only)
+          if [ ! -f .env ]; then
+            touch .env
+          fi
+          
+          docker compose config > /dev/null
+
+      - name: Check required services
+        if: steps.check_compose.outputs.exists == 'true'
+        run: |
+          echo "Checking services..."
+          cd ops/${{ matrix.environment }}
+          
+          expected_services=("postgres" "redis")
+          
+          for service in "${expected_services[@]}"; do
+            if docker compose config --services | grep -q "^${service}$"; then
+              echo "Service '$service' configured"
+            fi
+          done
+
+      - name: Validate image availability
+        if: steps.check_compose.outputs.exists == 'true'
+        run: |
+          echo "Validating images..."
+          cd ops/${{ matrix.environment }}
+          docker compose pull --quiet || echo "Warning: Some images may not be publicly available"
+
+  validate-structure:
+    name: "Structure Validation"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check directory structure
+        run: |
+          echo "Validating directory structure..."
+          
+          expected_dirs=("development" "production")
+          
+          for dir in "${expected_dirs[@]}"; do
+            if [ -d "ops/$dir" ]; then
+              echo "Directory ops/$dir exists"
+            else
+              echo "Warning: ops/$dir not found"
+            fi
+          done
+
+      - name: Check documentation
+        run: |
+          echo "Checking documentation..."
+          
+          docs_found=0
+          
+          if [ -f "ops/README.md" ]; then
+            echo "Found ops/README.md"
+            docs_found=1
+          fi
+          
+          if [ -f "README.md" ]; then
+            if grep -qi "deployment\|docker\|ops" README.md; then
+              echo "Found deployment info in root README.md"
+              docs_found=1
+            fi
+          fi
+          
+          if [ $docs_found -eq 0 ]; then
+            echo "Warning: No deployment documentation found"
+          fi
+
+      - name: Check environment examples
+        run: |
+          echo "Checking for .env.example files..."
+          
+          env_examples=$(find ops/ -name ".env.example" -o -name "*.env.example")
+          
+          if [ -z "$env_examples" ]; then
+            echo "Warning: No .env.example files found"
+          else
+            echo "Found environment examples:"
+            echo "$env_examples"
+          fi
